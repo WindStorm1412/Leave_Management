@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#2563eb">
+  <title>LeaveSystem - Quản lý nghỉ phép</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem('leave-system-theme');
+        const theme = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        document.documentElement.dataset.theme = theme;
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#070b14' : '#2563eb');
+      } catch {
+        document.documentElement.dataset.theme = 'light';
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <section id="login-screen" class="login-screen">
+    <button id="login-theme-toggle" class="theme-toggle login-theme-toggle" type="button" aria-label="Chuyển giao diện">
+      <span class="theme-icon" aria-hidden="true">☾</span>
+      <span class="theme-label">Dark</span>
+    </button>
+    <div class="login-card">
+      <div class="brand-mark">✓</div>
+      <h1>Quản lý Nghỉ phép</h1>
+      <p class="login-subtitle">Hệ thống phê duyệt nhân sự phân cấp</p>
+      <form id="login-form">
+        <label class="field-label" for="login-user">Tên đăng nhập</label>
+        <input class="input" id="login-user" name="username" autocomplete="username" value="nhanvien01" required>
+        <label class="field-label" for="login-pass">Mật khẩu</label>
+        <div class="password-wrap">
+          <input class="input" id="login-pass" name="password" type="password" autocomplete="current-password" value="123456" required>
+          <button class="password-toggle" type="button" aria-label="Hiện mật khẩu">👁</button>
+        </div>
+        <p id="login-error" class="form-error" hidden></p>
+        <button class="btn btn-primary btn-block" type="submit">
+          <span>Đăng nhập</span>
+          <span aria-hidden="true">→</span>
+        </button>
+      </form>
+      <div class="demo-box">
+        <p>Tài khoản demo · mật khẩu <strong>123456</strong></p>
+        <div class="demo-accounts">
+          <button data-account="nhanvien01">Nhân viên</button>
+          <button data-account="leader01">Trưởng nhóm</button>
+          <button data-account="manager01">Trưởng phòng</button>
+          <button data-account="hr01">HR</button>
+          <button data-account="admin">Admin</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="app" class="app" hidden>
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-brand">
+        <div class="sidebar-brand-icon">✓</div>
+        <div>
+          <strong>LeaveSystem</strong>
+          <small>Quản lý nhân sự</small>
+        </div>
+        <button id="close-sidebar" class="icon-button sidebar-close" aria-label="Đóng menu">×</button>
+      </div>
+      <div class="sidebar-user">
+        <div id="user-avatar" class="avatar">NV</div>
+        <div class="sidebar-user-text">
+          <strong id="user-name"></strong>
+          <span id="user-role"></span>
+        </div>
+      </div>
+      <nav id="nav-menu" class="nav-menu"></nav>
+      <div class="sidebar-footer">
+        <button id="logout-button" class="logout-button"><span>↪</span> Đăng xuất</button>
+      </div>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="open-sidebar" class="icon-button menu-button" aria-label="Mở menu">☰</button>
+        <div>
+          <h2 id="page-title">Dashboard</h2>
+          <p id="page-breadcrumb">Tổng quan hệ thống</p>
+        </div>
+        <div class="topbar-actions">
+          <button id="theme-toggle" class="theme-toggle theme-toggle-compact" type="button" aria-label="Chuyển giao diện">
+            <span class="theme-icon" aria-hidden="true">☾</span>
+            <span class="theme-label">Dark</span>
+          </button>
+          <button id="notification-button" class="icon-button notification-button" aria-label="Thông báo">
+            ♢
+            <span id="notification-count" class="notification-count" hidden>0</span>
+          </button>
+          <button id="profile-shortcut" class="topbar-profile">
+            <span id="topbar-avatar" class="avatar avatar-small">NV</span>
+            <span id="topbar-name"></span>
+          </button>
+        </div>
+      </header>
+      <div id="page-content" class="page-content">
+        <div class="loading-state"><span class="spinner"></span> Đang tải dữ liệu...</div>
+      </div>
+    </main>
+
+    <aside id="notification-panel" class="notification-panel">
+      <div class="drawer-header">
+        <div>
+          <h3>Thông báo</h3>
+          <p id="notification-subtitle">Cập nhật mới nhất</p>
+        </div>
+        <button id="close-notifications" class="icon-button">×</button>
+      </div>
+      <div class="drawer-actions">
+        <button id="read-all-notifications" class="drawer-action">Đánh dấu tất cả đã đọc</button>
+        <button id="delete-read-notifications" class="drawer-action drawer-action-danger">Xóa đã đọc</button>
+      </div>
+      <div id="notification-list" class="notification-list"></div>
+    </aside>
+  </div>
+
+  <div id="modal" class="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <header class="modal-header">
+        <div>
+          <h3 id="modal-title"></h3>
+          <p id="modal-subtitle"></p>
+        </div>
+        <button id="modal-close" class="icon-button" aria-label="Đóng">×</button>
+      </header>
+      <div id="modal-body" class="modal-body"></div>
+      <footer id="modal-footer" class="modal-footer"></footer>
+    </section>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/js/core.js" defer></script>
+  <script src="/js/pages/employee.js" defer></script>
+  <script src="/js/pages/hr.js" defer></script>
+  <script src="/js/pages/admin.js" defer></script>
+  <script src="/js/main.js" defer></script>
+</body>
+</html>

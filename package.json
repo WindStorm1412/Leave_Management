@@ -1,0 +1,20 @@
+{
+  "name": "leave-management-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hệ thống quản lý nghỉ phép có phân quyền và MySQL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node scripts/check-source.js",
+    "test": "node tests/api.test.js",
+    "migrate:sqlite": "node --disable-warning=ExperimentalWarning scripts/migrate-sqlite-to-mysql.js"
+  },
+  "dependencies": {
+    "mysql2": "^3.15.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
