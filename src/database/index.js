@@ -71,6 +71,72 @@ function readSchema() {
   return sql.slice(firstTable);
 }
 
+async function columnExists(table, column) {
+  const row = await db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
+  `).get(config.database, table, column);
+  return Number(row.count) > 0;
+}
+
+async function columnType(table, column) {
+  const row = await db.prepare(`
+    SELECT COLUMN_TYPE AS column_type
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
+  `).get(config.database, table, column);
+  return String(row?.column_type || '');
+}
+
+async function upgradeSchema() {
+  if (!await columnExists('departments', 'leader_id')) {
+    await db.exec(
+      "ALTER TABLE departments ADD COLUMN leader_id INT UNSIGNED NULL COMMENT 'Trưởng nhóm được phân công' AFTER name"
+    );
+  }
+  if (!await columnExists('departments', 'manager_id')) {
+    await db.exec(
+      "ALTER TABLE departments ADD COLUMN manager_id INT UNSIGNED NULL COMMENT 'Trưởng phòng được phân công' AFTER leader_id"
+    );
+  }
+  if (!await columnType('approvals', 'approver_role').then((type) => type.includes("'admin'"))) {
+    await db.exec(`
+      ALTER TABLE approvals
+      MODIFY COLUMN approver_role ENUM('leader','manager','hr','admin') NOT NULL
+    `);
+  }
+  await db.exec(`
+    UPDATE departments d
+    SET d.leader_id = (
+      SELECT MIN(u.id) FROM users u
+      WHERE u.department_id = d.id AND u.role = 'leader' AND u.active = 1
+    )
+    WHERE d.leader_id IS NULL
+  `);
+  await db.exec(`
+    UPDATE departments d
+    SET d.manager_id = (
+      SELECT MIN(u.id) FROM users u
+      WHERE u.department_id = d.id AND u.role = 'manager' AND u.active = 1
+    )
+    WHERE d.manager_id IS NULL
+  `);
+  await db.exec(`
+    UPDATE approvals a
+    JOIN leave_requests r ON r.id = a.request_id
+    JOIN users requester ON requester.id = r.user_id
+    JOIN departments d ON d.id = requester.department_id
+    SET a.approver_id = CASE
+      WHEN a.approver_role = 'leader' THEN d.leader_id
+      WHEN a.approver_role = 'manager' THEN d.manager_id
+      ELSE a.approver_id
+    END
+    WHERE a.approver_id IS NULL
+      AND a.approver_role IN ('leader', 'manager')
+  `);
+}
+
 async function initializeDatabase() {
   if (config.autoCreate) {
     const bootstrap = await mysql.createConnection({
@@ -106,6 +172,7 @@ async function initializeDatabase() {
   });
 
   await db.exec(readSchema());
+  await upgradeSchema();
   if (config.autoSeed) await seed(db, hashPassword);
   return pool;
 }

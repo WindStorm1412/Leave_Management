@@ -34,11 +34,26 @@ async function seed(db, hashPassword) {
     ['NV005', 'nhanvien03', password, 'Phạm Thị E', 'pte@company.vn', '0901000005', 'employee', departments['Kinh doanh'], '2021-11-20', 'PE'],
     ['NV006', 'nhanvien04', password, 'Lê Thị F', 'ltf@company.vn', '0901000006', 'employee', departments['Marketing'], '2022-07-01', 'LF'],
     ['NV007', 'hr01', password, 'Phạm Thị HR', 'hr@company.vn', '0901000007', 'hr', departments['Nhân sự'], '2018-01-01', 'HR'],
-    ['NV008', 'admin', password, 'Admin Hệ thống', 'admin@company.vn', '0901000008', 'admin', departments['Công nghệ thông tin'], '2018-01-01', 'AD']
+    ['NV008', 'admin', password, 'Admin Hệ thống', 'admin@company.vn', '0901000008', 'admin', departments['Công nghệ thông tin'], '2018-01-01', 'AD'],
+    ['NV009', 'leader02', password, 'Nguyễn Minh Khang', 'nmk@company.vn', '0901000009', 'leader', departments['Kinh doanh'], '2020-04-10', 'NK'],
+    ['NV010', 'manager02', password, 'Vũ Thu Hà', 'vth@company.vn', '0901000010', 'manager', departments['Kinh doanh'], '2019-02-12', 'VH'],
+    ['NV011', 'leader03', password, 'Đặng Hoàng Nam', 'dhn@company.vn', '0901000011', 'leader', departments['Marketing'], '2021-05-20', 'DN'],
+    ['NV012', 'manager03', password, 'Bùi Ngọc Mai', 'bnm@company.vn', '0901000012', 'manager', departments['Marketing'], '2019-08-08', 'BM']
   ];
   for (const row of users) {
     await insertUser.run(...row);
   }
+  await db.exec(`
+    UPDATE departments d
+    SET d.leader_id = (
+      SELECT MIN(u.id) FROM users u
+      WHERE u.department_id = d.id AND u.role = 'leader' AND u.active = 1
+    ),
+    d.manager_id = (
+      SELECT MIN(u.id) FROM users u
+      WHERE u.department_id = d.id AND u.role = 'manager' AND u.active = 1
+    )
+  `);
 
   const insertType = db.prepare(`
     INSERT INTO leave_types
@@ -129,6 +144,11 @@ async function seed(db, hashPassword) {
       created
     );
     const requestId = Number(result.lastInsertRowid);
+    const departmentApprovers = await db.prepare(`
+      SELECT d.leader_id, d.manager_id
+      FROM users u JOIN departments d ON d.id = u.department_id
+      WHERE u.id = ?
+    `).get(userByName[userName]);
     const actions = status === 'approved'
       ? ['approved', 'approved', 'approved']
       : status === 'pending_manager'
@@ -140,10 +160,12 @@ async function seed(db, hashPassword) {
             : ['pending', 'waiting', 'waiting'];
 
     for (const [index, role] of ['leader', 'manager', 'hr'].entries()) {
-      const approverName = role === 'leader'
-        ? 'Lê Văn C'
-        : role === 'manager' ? 'Trần Thị B' : 'Phạm Thị HR';
       const done = ['approved', 'rejected'].includes(actions[index]);
+      const approverId = role === 'leader'
+        ? departmentApprovers.leader_id
+        : role === 'manager'
+          ? departmentApprovers.manager_id
+          : userByName['Phạm Thị HR'];
       await db.prepare(`
         INSERT INTO approvals
           (request_id, step, approver_role, approver_id, action, note, acted_at)
@@ -152,7 +174,7 @@ async function seed(db, hashPassword) {
         requestId,
         index + 1,
         role,
-        done ? userByName[approverName] : null,
+        ['leader', 'manager'].includes(role) || done ? approverId : null,
         actions[index],
         actions[index] === 'rejected'
           ? 'Thời điểm dự án chưa phù hợp'

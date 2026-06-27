@@ -13,6 +13,55 @@ const {
   isDuplicateError
 } = require('../leave-utils');
 
+async function validateDepartment(departmentId, client = db) {
+  if (!departmentId) return false;
+  return Boolean(await client.prepare('SELECT id FROM departments WHERE id = ?').get(departmentId));
+}
+
+async function syncDepartmentPosition(userId, role, departmentId, active, client = db) {
+  await client.prepare(`
+    UPDATE approvals SET approver_id = NULL
+    WHERE approver_id = ? AND action IN ('pending', 'waiting')
+  `).run(userId);
+  await client.prepare(`
+    UPDATE departments SET leader_id = NULL WHERE leader_id = ?
+  `).run(userId);
+  await client.prepare(`
+    UPDATE departments SET manager_id = NULL WHERE manager_id = ?
+  `).run(userId);
+  if (!active || !departmentId) return;
+  if (role === 'leader') {
+    await client.prepare(`
+      UPDATE departments SET leader_id = COALESCE(leader_id, ?) WHERE id = ?
+    `).run(userId, departmentId);
+    await client.prepare(`
+      UPDATE approvals a
+      JOIN leave_requests r ON r.id = a.request_id
+      JOIN users requester ON requester.id = r.user_id
+      JOIN departments d ON d.id = requester.department_id
+      SET a.approver_id = ?
+      WHERE requester.department_id = ? AND a.approver_role = 'leader'
+        AND d.leader_id = ?
+        AND a.action IN ('pending', 'waiting') AND a.approver_id IS NULL
+    `).run(userId, departmentId, userId);
+  }
+  if (role === 'manager') {
+    await client.prepare(`
+      UPDATE departments SET manager_id = COALESCE(manager_id, ?) WHERE id = ?
+    `).run(userId, departmentId);
+    await client.prepare(`
+      UPDATE approvals a
+      JOIN leave_requests r ON r.id = a.request_id
+      JOIN users requester ON requester.id = r.user_id
+      JOIN departments d ON d.id = requester.department_id
+      SET a.approver_id = ?
+      WHERE requester.department_id = ? AND a.approver_role = 'manager'
+        AND d.manager_id = ?
+        AND a.action IN ('pending', 'waiting') AND a.approver_id IS NULL
+    `).run(userId, departmentId, userId);
+  }
+}
+
 async function handleHR(req, res, url) {
   const { pathname } = url;
   const method = req.method;
@@ -21,7 +70,9 @@ async function handleHR(req, res, url) {
     const user = await requireAuth(req, res, ['hr', 'admin']);
     if (!user) return true;
     const items = (await db.prepare(`
-      SELECT u.*, d.name AS department_name
+      SELECT u.*, d.name AS department_name,
+             (d.leader_id = u.id) AS is_department_leader,
+             (d.manager_id = u.id) AS is_department_manager
       FROM users u LEFT JOIN departments d ON d.id = u.department_id
       ORDER BY u.employee_code
     `).all()).map(publicUser);
@@ -43,6 +94,9 @@ async function handleHR(req, res, url) {
     if (!employeeCode || !username || !fullName || !email
       || !validDate(startDate) || !ROLE_LABELS[role]) {
       return fail(res, 400, 'Thông tin nhân sự chưa đầy đủ hoặc không hợp lệ.');
+    }
+    if (role !== 'admin' && !await validateDepartment(departmentId)) {
+      return fail(res, 400, 'Vui lòng chọn phòng ban hợp lệ cho nhân sự.');
     }
     if (role === 'admin' && user.role !== 'admin') {
       return fail(res, 403, 'Chỉ quản trị viên được tạo tài khoản admin.');
@@ -70,11 +124,14 @@ async function handleHR(req, res, url) {
           initials(fullName)
         );
         const row = await client.prepare(`
-          SELECT u.*, d.name AS department_name
+          SELECT u.*, d.name AS department_name,
+                 (d.leader_id = u.id) AS is_department_leader,
+                 (d.manager_id = u.id) AS is_department_manager
           FROM users u
           LEFT JOIN departments d ON d.id = u.department_id
           WHERE u.id = ?
         `).get(Number(result.lastInsertRowid));
+        await syncDepartmentPosition(row.id, role, departmentId, true, client);
         const annualTypes = await client.prepare(`
           SELECT id FROM leave_types WHERE active = 1 AND annual_quota > 0
         `).all();
@@ -108,6 +165,8 @@ async function handleHR(req, res, url) {
     if (!target) return fail(res, 404, 'Không tìm thấy nhân sự.');
     const body = await readBody(req);
     const role = String(body.role || target.role);
+    const departmentId = Number(body.departmentId ?? target.department_id);
+    const active = body.active === undefined ? Boolean(target.active) : Boolean(body.active);
     if ((target.role === 'admin' || role === 'admin') && actor.role !== 'admin') {
       return fail(res, 403, 'Chỉ admin được chỉnh sửa tài khoản admin.');
     }
@@ -116,6 +175,9 @@ async function handleHR(req, res, url) {
     }
     if (body.password && String(body.password).length < 6) {
       return fail(res, 400, 'Mật khẩu phải có ít nhất 6 ký tự.');
+    }
+    if (role !== 'admin' && !await validateDepartment(departmentId)) {
+      return fail(res, 400, 'Vui lòng chọn phòng ban hợp lệ cho nhân sự.');
     }
     try {
       await db.transaction(async (client) => {
@@ -129,12 +191,13 @@ async function handleHR(req, res, url) {
           String(body.email ?? target.email).trim(),
           String(body.phone ?? target.phone).trim(),
           role,
-          Number(body.departmentId ?? target.department_id),
+          departmentId || null,
           String(body.startDate ?? target.start_date),
-          body.active === undefined ? target.active : body.active ? 1 : 0,
+          active ? 1 : 0,
           initials(String(body.fullName ?? target.full_name)),
           targetId
         );
+        await syncDepartmentPosition(targetId, role, departmentId, active, client);
         if (body.password) {
           await client.prepare(
             'UPDATE users SET password_hash = ? WHERE id = ?'

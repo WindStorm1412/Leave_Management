@@ -44,6 +44,7 @@ async function renderRequests() {
         <option value="pending_leader">Chờ trưởng nhóm</option>
         <option value="pending_manager">Chờ trưởng phòng</option>
         <option value="pending_hr">Chờ HR</option>
+        <option value="pending_admin">Chờ quản trị viên</option>
         <option value="approved">Đã duyệt</option>
         <option value="rejected">Đã từ chối</option>
         <option value="cancelled">Đã hủy</option>
@@ -173,6 +174,13 @@ function openCreateRequest() {
             </div>
           `).join('')}
         </div>` : '';
+      const approvalFlow = data.approvalFlow?.length ? `
+        <div class="preview-approval-flow">
+          <strong>Luồng phê duyệt</strong>
+          <div>${data.approvalFlow.map((step, index) => `
+            <span><b>${index + 1}</b>${esc(ROLE_LABELS[step.role] || step.role)}<small>${esc(step.approverName || 'Theo phân công')}</small></span>
+          `).join('<i>→</i>')}</div>
+        </div>` : '';
       preview.innerHTML = `
         <div class="preview-grid">
           <div><span>Số ngày làm việc</span><strong>${data.days}</strong></div>
@@ -180,6 +188,7 @@ function openCreateRequest() {
           <div><span>Còn lại sau đơn</span><strong>${balance ? balance.remainingAfter : '—'}</strong></div>
         </div>
         ${warnings ? `<ul class="preview-warnings">${warnings}</ul>` : '<p class="preview-ok">Đơn hợp lệ, có thể gửi phê duyệt.</p>'}
+        ${approvalFlow}
         ${conflicts}`;
     } catch (error) {
       preview.className = 'request-preview danger';
@@ -225,22 +234,24 @@ function openCreateRequest() {
 async function showRequestDetail(id) {
   try {
     const { item } = await api(`/api/requests/${id}`);
-    const timeline = item.approvals.map((approval) => {
+    const timeline = item.approvals.map((approval, index) => {
+      const assignedName = approval.approverName || approval.roleLabel;
+      const stopped = ['cancelled', 'rejected_by_leader', 'rejected_by_manager', 'rejected_by_hr', 'rejected_by_admin'].includes(item.status)
+        && ['waiting', 'pending'].includes(approval.action);
       const actionText = {
-        waiting: 'Chưa đến lượt xử lý',
-        pending: 'Đang chờ xử lý',
+        waiting: stopped ? 'Quy trình đã dừng' : `Chưa đến lượt · phụ trách: ${assignedName}`,
+        pending: stopped ? 'Quy trình đã dừng' : `Đang chờ ${assignedName} xử lý`,
         approved: `Đã duyệt bởi ${approval.approverName}`,
         rejected: `Đã từ chối bởi ${approval.approverName}`
       }[approval.action];
       return `<div class="timeline-item">
         <span class="timeline-dot ${approval.action}"></span>
-        <div class="timeline-title">${esc(approval.roleLabel)}</div>
+        <div class="timeline-title">Cấp ${index + 1} · ${esc(approval.roleLabel)}</div>
         <div class="timeline-meta">${esc(actionText)}${approval.actedAt ? ` · ${formatDateTime(approval.actedAt)}` : ''}</div>
         ${approval.note ? `<div class="timeline-note">“${esc(approval.note)}”</div>` : ''}
       </div>`;
     }).join('');
-    const expected = { leader: 'pending_leader', manager: 'pending_manager', hr: 'pending_hr' }[state.user.role];
-    const canApprove = expected === item.status && item.userId !== state.user.id;
+    const canApprove = Boolean(item.canApprove);
     const canCancel = item.userId === state.user.id && item.status.startsWith('pending_');
     openModal({
       title: `Chi tiết đơn ${item.code}`,
@@ -339,17 +350,40 @@ async function renderBalance() {
 }
 
 async function renderApprovals() {
-  const { items } = await api('/api/approvals');
+  const { items, history } = await api('/api/approvals');
   $('#page-content').innerHTML = `
     ${pageHeading('Đơn chờ phê duyệt', `${items.length} đơn đang chờ bạn xử lý`,
       '<button id="export-team-requests" class="btn btn-outline">⇩ Xuất CSV</button>')}
     ${items.length ? `<div class="alert alert-info">Bạn chỉ thấy các đơn đúng cấp duyệt và thuộc phạm vi phòng ban của mình.</div>` : ''}
     <section class="card">
+      <div class="card-header"><div><h3>Cần xử lý</h3><p>Đơn đang ở đúng cấp duyệt của bạn</p></div></div>
       ${table(['Mã đơn', 'Nhân viên', 'Loại phép', 'Thời gian', 'Số ngày', 'Trạng thái', 'Hành động'], requestRows(items, 'approve'))}
+    </section>
+    <section class="card approval-history-card">
+      <div class="card-header"><div><h3>Lịch sử tôi đã duyệt</h3><p>100 quyết định gần nhất, bao gồm nhận xét và thời gian xử lý</p></div></div>
+      ${table(
+        ['Mã đơn', 'Nhân viên', 'Phòng ban', 'Quyết định', 'Thời gian', 'Nhận xét', ''],
+        history.map((item) => [
+          `<strong>${esc(item.code)}</strong>`,
+          esc(item.employeeName),
+          esc(item.department || '—'),
+          item.decisionAction === 'approved'
+            ? '<span class="badge badge-success">Đã duyệt</span>'
+            : '<span class="badge badge-danger">Đã từ chối</span>',
+          formatDateTime(item.decisionAt),
+          esc(item.decisionNote || '—'),
+          `<button class="btn btn-outline btn-small request-detail" data-id="${item.id}">Xem luồng duyệt</button>`
+        ])
+      )}
     </section>`;
   $('#export-team-requests').addEventListener('click', () => {
-    const pendingStatus = { leader: 'pending_leader', manager: 'pending_manager', hr: 'pending_hr' }[state.user.role];
-    const scope = state.user.role === 'hr' ? 'all' : 'team';
+    const pendingStatus = {
+      leader: 'pending_leader',
+      manager: 'pending_manager',
+      hr: 'pending_hr',
+      admin: 'pending_admin'
+    }[state.user.role];
+    const scope = ['hr', 'admin'].includes(state.user.role) ? 'all' : 'team';
     downloadFile(`/api/export/requests?scope=${scope}&status=${pendingStatus}`);
   });
   bindRequestActions($('#page-content'));

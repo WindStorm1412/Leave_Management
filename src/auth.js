@@ -46,6 +46,8 @@ function publicUser(row) {
     roleLabel: ROLE_LABELS[row.role],
     departmentId: row.department_id,
     department: row.department_name || '',
+    isDepartmentLeader: Boolean(row.is_department_leader),
+    isDepartmentManager: Boolean(row.is_department_manager),
     startDate: row.start_date,
     active: Boolean(row.active),
     avatar: row.avatar || initials(row.full_name)
@@ -56,7 +58,9 @@ async function currentUser(req) {
   const token = parseCookies(req).leave_session;
   if (!token) return null;
   const row = await db.prepare(`
-    SELECT u.*, d.name AS department_name
+    SELECT u.*, d.name AS department_name,
+           (d.leader_id = u.id) AS is_department_leader,
+           (d.manager_id = u.id) AS is_department_manager
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     LEFT JOIN departments d ON d.id = u.department_id

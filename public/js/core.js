@@ -28,10 +28,12 @@ const STATUS_CLASS = {
   pending_leader: 'badge-warning',
   pending_manager: 'badge-info',
   pending_hr: 'badge-purple',
+  pending_admin: 'badge-dark',
   approved: 'badge-success',
   rejected_by_leader: 'badge-danger',
   rejected_by_manager: 'badge-danger',
   rejected_by_hr: 'badge-danger',
+  rejected_by_admin: 'badge-danger',
   cancelled: 'badge-muted'
 };
 
@@ -101,6 +103,7 @@ const NAV = {
   admin: [
     ['Hệ thống', [
       ['dashboard', '▦', 'Dashboard'],
+      ['approvals', '✓', 'Đơn chờ duyệt'],
       ['admin', '⚙', 'Quản trị hệ thống'],
       ['hr', '♙', 'Quản lý nhân sự'],
       ['calendar', '▦', 'Lịch nghỉ'],
@@ -296,7 +299,7 @@ function renderNav() {
     `).join('')}
   `).join('');
   $$('.nav-link').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.page)));
-  if (['leader', 'manager', 'hr'].includes(state.user.role)) updateApprovalBadge();
+  if (['leader', 'manager', 'hr', 'admin'].includes(state.user.role)) updateApprovalBadge();
 }
 
 async function updateApprovalBadge() {

@@ -75,18 +75,28 @@ async function handleAuthDashboard(req, res, url) {
     const user = await requireAuth(req, res);
     if (!user) return true;
     const isEmployee = user.role === 'employee';
-    const ownClause = isEmployee ? 'r.user_id = ?' : '1=1';
-    const ownParams = isEmployee ? [user.id] : [];
+    const isDepartmentManager = ['leader', 'manager'].includes(user.role);
+    const ownClause = isEmployee
+      ? 'r.user_id = ?'
+      : isDepartmentManager ? 'u.department_id = ?' : '1=1';
+    const ownParams = isEmployee
+      ? [user.id]
+      : isDepartmentManager ? [user.departmentId] : [];
     const total = Number((await db.prepare(
-      `SELECT COUNT(*) AS count FROM leave_requests r WHERE ${ownClause}`
+      `SELECT COUNT(*) AS count
+       FROM leave_requests r JOIN users u ON u.id = r.user_id
+       WHERE ${ownClause}`
     ).get(...ownParams)).count);
     const approved = Number((await db.prepare(
-      `SELECT COUNT(*) AS count FROM leave_requests r WHERE ${ownClause} AND r.status = 'approved'`
+      `SELECT COUNT(*) AS count
+       FROM leave_requests r JOIN users u ON u.id = r.user_id
+       WHERE ${ownClause} AND r.status = 'approved'`
     ).get(...ownParams)).count);
     const pendingStatus = {
       leader: 'pending_leader',
       manager: 'pending_manager',
-      hr: 'pending_hr'
+      hr: 'pending_hr',
+      admin: 'pending_admin'
     }[user.role];
     let pending;
     if (isEmployee) {
@@ -95,16 +105,19 @@ async function handleAuthDashboard(req, res, url) {
         WHERE user_id = ? AND status LIKE 'pending_%'
       `).get(user.id)).count);
     } else if (pendingStatus) {
-      const departmentClause = ['leader', 'manager'].includes(user.role)
-        ? ' AND u.department_id = ?'
-        : '';
+      const assignmentClause = ['leader', 'manager'].includes(user.role)
+        ? ' AND a.approver_id = ?'
+        : ' AND (a.approver_id IS NULL OR a.approver_id = ?)';
       const args = ['leader', 'manager'].includes(user.role)
-        ? [pendingStatus, user.departmentId]
-        : [pendingStatus];
+        ? [user.role, user.id, user.id]
+        : [user.role, user.id, user.id];
       pending = Number((await db.prepare(`
         SELECT COUNT(*) AS count FROM leave_requests r
         JOIN users u ON u.id = r.user_id
-        WHERE r.status = ?${departmentClause}
+        JOIN approvals a ON a.request_id = r.id
+        WHERE a.approver_role = ? AND a.action = 'pending'
+          AND r.status = CONCAT('pending_', a.approver_role)
+          AND r.user_id != ?${assignmentClause}
       `).get(...args)).count);
     } else {
       pending = Number((await db.prepare(`
@@ -121,21 +134,23 @@ async function handleAuthDashboard(req, res, url) {
       SELECT COUNT(*) AS count FROM users WHERE role != 'admin' AND active = 1
     `).get()).count);
     const monthly = await db.prepare(`
-      SELECT MONTH(start_date) AS month, SUM(days) AS days
-      FROM leave_requests r
-      WHERE YEAR(start_date) = ? AND status = 'approved'
-        ${isEmployee ? 'AND user_id = ?' : ''}
+      SELECT MONTH(r.start_date) AS month, SUM(r.days) AS days
+      FROM leave_requests r JOIN users u ON u.id = r.user_id
+      WHERE YEAR(r.start_date) = ? AND r.status = 'approved'
+        AND ${ownClause}
       GROUP BY month ORDER BY month
-    `).all(...(isEmployee ? [year, user.id] : [year]));
+    `).all(year, ...ownParams);
     const byType = await db.prepare(`
       SELECT lt.name, COUNT(*) AS total
-      FROM leave_requests r JOIN leave_types lt ON lt.id = r.leave_type_id
+      FROM leave_requests r
+      JOIN users u ON u.id = r.user_id
+      JOIN leave_types lt ON lt.id = r.leave_type_id
       WHERE ${ownClause}
       GROUP BY lt.id ORDER BY total DESC
     `).all(...ownParams);
     const recentRows = await requestRows(
-      isEmployee ? 'r.user_id = ?' : '1=1',
-      isEmployee ? [user.id] : [],
+      ownClause,
+      ownParams,
       6
     );
     const recent = await serializeRequests(recentRows);

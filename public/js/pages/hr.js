@@ -31,13 +31,21 @@ async function renderEmployees(target, adminMode = false) {
   target.innerHTML = `
     <div class="toolbar">
       <div class="search"><input id="employee-search" class="input" placeholder="Tìm tên, mã nhân viên, email..."></div>
+      <select id="employee-department-filter" class="input">
+        <option value="">Tất cả phòng ban</option>
+        ${state.departments.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join('')}
+      </select>
       <button id="export-employees" class="btn btn-outline">⇩ Xuất CSV</button>
       <button id="add-employee" class="btn btn-primary filters-end">＋ Thêm nhân viên</button>
     </div>
     <section id="employee-table" class="card"></section>`;
   const draw = () => {
     const query = $('#employee-search').value.toLowerCase().trim();
-    const filtered = state.hrUsers.filter((item) => `${item.employeeCode} ${item.fullName} ${item.email} ${item.username}`.toLowerCase().includes(query));
+    const departmentId = Number($('#employee-department-filter').value || 0);
+    const filtered = state.hrUsers.filter((item) => {
+      const matchesText = `${item.employeeCode} ${item.fullName} ${item.email} ${item.username}`.toLowerCase().includes(query);
+      return matchesText && (!departmentId || item.departmentId === departmentId);
+    });
     $('#employee-table').innerHTML = table(
       ['Mã NV', 'Họ tên', 'Tài khoản', 'Phòng ban', 'Vai trò', 'Trạng thái', ''],
       filtered.map((item) => [
@@ -45,7 +53,9 @@ async function renderEmployees(target, adminMode = false) {
         `<div class="cell-user"><span class="avatar">${esc(item.avatar)}</span><div><strong>${esc(item.fullName)}</strong><small>${esc(item.email)}</small></div></div>`,
         esc(item.username),
         esc(item.department || '—'),
-        roleBadge(item.role),
+        `${roleBadge(item.role)}
+          ${item.isDepartmentManager ? '<small class="assignment-note">Trưởng phòng được phân công</small>' : ''}
+          ${item.isDepartmentLeader ? '<small class="assignment-note">Trưởng nhóm được phân công</small>' : ''}`,
         activeBadge(item.active),
         `<button class="btn btn-outline btn-small edit-employee" data-id="${item.id}">Chỉnh sửa</button>`
       ])
@@ -54,6 +64,7 @@ async function renderEmployees(target, adminMode = false) {
   };
   draw();
   $('#employee-search').addEventListener('input', draw);
+  $('#employee-department-filter').addEventListener('change', draw);
   $('#export-employees').addEventListener('click', () => downloadFile('/api/export/users'));
   $('#add-employee').addEventListener('click', () => openEmployeeForm(null, adminMode));
 }
@@ -76,6 +87,7 @@ function openEmployeeForm(item = null, adminMode = false) {
       <div class="form-group"><label class="field-label">Vai trò</label><select id="employee-role" class="input">
         ${roles.map(([role, label]) => `<option value="${role}" ${role === item?.role ? 'selected' : ''}>${esc(label)}</option>`).join('')}
       </select></div>
+      <div class="form-group full"><span class="form-hint">Phòng ban xác định phạm vi dữ liệu. Chức vụ xác định cấp quyền; admin có thể chỉ định trưởng nhóm/trưởng phòng chính thức tại Quản trị → Phòng ban.</span></div>
       <div class="form-group"><label class="field-label">Ngày vào làm</label><input id="employee-start" class="input" type="date" value="${esc(item?.startDate || new Date().toISOString().slice(0, 10))}"></div>
       <div class="form-group"><label class="field-label">${isEdit ? 'Mật khẩu mới (nếu đổi)' : 'Mật khẩu ban đầu'}</label><input id="employee-password" class="input" type="password" placeholder="${isEdit ? 'Để trống nếu không đổi' : '123456'}"></div>
       ${isEdit ? `<div class="form-group full"><label class="check-row"><input id="employee-active" type="checkbox" ${item.active ? 'checked' : ''}> Tài khoản đang hoạt động</label></div>` : ''}
@@ -278,6 +290,7 @@ async function renderAllRequests(target) {
         <option value="pending_leader">Chờ trưởng nhóm</option>
         <option value="pending_manager">Chờ trưởng phòng</option>
         <option value="pending_hr">Chờ HR</option>
+        <option value="pending_admin">Chờ quản trị viên</option>
         <option value="approved">Đã duyệt</option>
         <option value="rejected">Đã từ chối</option>
         <option value="cancelled">Đã hủy</option>

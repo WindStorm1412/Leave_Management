@@ -14,7 +14,76 @@ const {
   ensureBalance
 } = require('../leave-utils');
 
-const ACTIVE_REQUEST_STATUS_SQL = "('cancelled','rejected_by_leader','rejected_by_manager','rejected_by_hr')";
+const ACTIVE_REQUEST_STATUS_SQL = "('cancelled','rejected_by_leader','rejected_by_manager','rejected_by_hr','rejected_by_admin')";
+
+async function buildApprovalFlow(user, client = db) {
+  if (user.role === 'hr') {
+    return { steps: [{ role: 'admin', approverId: null, approverName: 'Quản trị viên' }] };
+  }
+
+  if (!user.departmentId) {
+    return { error: 'Tài khoản chưa được xếp vào phòng ban.' };
+  }
+  const department = await client.prepare(`
+    SELECT d.*,
+           leader.full_name AS leader_name, leader.active AS leader_active,
+           leader.role AS leader_role, leader.department_id AS leader_department_id,
+           manager.full_name AS manager_name, manager.active AS manager_active,
+           manager.role AS manager_role, manager.department_id AS manager_department_id
+    FROM departments d
+    LEFT JOIN users leader ON leader.id = d.leader_id
+    LEFT JOIN users manager ON manager.id = d.manager_id
+    WHERE d.id = ?
+  `).get(user.departmentId);
+  if (!department) return { error: 'Phòng ban của tài khoản không còn tồn tại.' };
+
+  const steps = [];
+  const validLeader = department.leader_id
+    && department.leader_active
+    && department.leader_role === 'leader'
+    && department.leader_department_id === department.id;
+  const validManager = department.manager_id
+    && department.manager_active
+    && department.manager_role === 'manager'
+    && department.manager_department_id === department.id;
+
+  if (user.role === 'employee' && validLeader && department.leader_id !== user.id) {
+    steps.push({
+      role: 'leader',
+      approverId: department.leader_id,
+      approverName: department.leader_name
+    });
+  }
+  if (['employee', 'leader'].includes(user.role)) {
+    if (!validManager || department.manager_id === user.id) {
+      return { error: `Phòng ${department.name} chưa có trưởng phòng hợp lệ để duyệt đơn.` };
+    }
+    steps.push({
+      role: 'manager',
+      approverId: department.manager_id,
+      approverName: department.manager_name
+    });
+  }
+  steps.push({ role: 'hr', approverId: null, approverName: 'Bộ phận Nhân sự' });
+  return { steps, departmentName: department.name };
+}
+
+async function canApproveRequest(user, requestId, client = db) {
+  const approval = await client.prepare(`
+    SELECT a.*, requester.department_id
+    FROM approvals a
+    JOIN leave_requests r ON r.id = a.request_id
+    JOIN users requester ON requester.id = r.user_id
+    WHERE a.request_id = ? AND a.action = 'pending'
+      AND r.status = CONCAT('pending_', a.approver_role)
+    ORDER BY a.step
+    LIMIT 1
+  `).get(requestId);
+  if (!approval || approval.approver_role !== user.role) return false;
+  if (approval.approver_id) return approval.approver_id === user.id;
+  if (['leader', 'manager'].includes(user.role)) return false;
+  return ['hr', 'admin'].includes(user.role);
+}
 
 async function buildRequestPreview(user, body) {
   const leaveTypeId = Number(body.leaveTypeId);
@@ -40,6 +109,11 @@ async function buildRequestPreview(user, body) {
   const days = await calculateBusinessDays(startDate, endDate);
   const warnings = [];
   let blocked = false;
+  const approvalFlow = await buildApprovalFlow(user);
+  if (approvalFlow.error) {
+    blocked = true;
+    warnings.push({ level: 'danger', message: approvalFlow.error });
+  }
 
   if (days < 1) {
     blocked = true;
@@ -156,6 +230,7 @@ async function buildRequestPreview(user, body) {
       status: row.status,
       statusLabel: STATUS_LABELS[row.status] || row.status
     })),
+    approvalFlow: approvalFlow.steps || [],
     warnings
   };
 }
@@ -219,11 +294,19 @@ async function handleRequests(req, res, url) {
     if (!user) return true;
     const row = await getRequest(Number(requestDetailMatch[1]));
     if (!row) return fail(res, 404, 'Không tìm thấy đơn nghỉ phép.');
+    const assignedApprover = await canApproveRequest(user, row.id);
+    const handledByUser = Boolean(await db.prepare(`
+      SELECT id FROM approvals WHERE request_id = ? AND approver_id = ? LIMIT 1
+    `).get(row.id, user.id));
     const canView = row.user_id === user.id
       || ['hr', 'admin'].includes(user.role)
+      || assignedApprover
+      || handledByUser
       || (['leader', 'manager'].includes(user.role) && row.department_id === user.departmentId);
     if (!canView) return fail(res, 403, 'Bạn không có quyền xem đơn này.');
-    return json(res, 200, { item: await serializeRequest(row, true) });
+    const item = await serializeRequest(row, true);
+    item.canApprove = assignedApprover && row.user_id !== user.id;
+    return json(res, 200, { item });
   }
 
   if (method === 'POST' && pathname === '/api/requests') {
@@ -257,11 +340,13 @@ async function handleRequests(req, res, url) {
     if (type.requires_proof && days >= 2 && !attachmentName) {
       return fail(res, 400, 'Loại phép này cần tên tệp minh chứng khi nghỉ từ 2 ngày.');
     }
+    const approvalFlow = await buildApprovalFlow(user);
+    if (approvalFlow.error) return fail(res, 409, approvalFlow.error);
 
     const overlap = await db.prepare(`
       SELECT request_code FROM leave_requests
       WHERE user_id = ?
-        AND status NOT IN ('cancelled','rejected_by_leader','rejected_by_manager','rejected_by_hr')
+        AND status NOT IN ${ACTIVE_REQUEST_STATUS_SQL}
         AND start_date <= ? AND end_date >= ?
       LIMIT 1
     `).get(user.id, endDate, startDate);
@@ -284,19 +369,37 @@ async function handleRequests(req, res, url) {
     const item = await db.transaction(async (client) => {
       const result = await client.prepare(`
         INSERT INTO leave_requests
-          (user_id, leave_type_id, start_date, end_date, days, reason, attachment_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(user.id, leaveTypeId, startDate, endDate, days, reason, attachmentName);
+          (user_id, leave_type_id, start_date, end_date, days, reason,
+           attachment_name, status, current_step)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        user.id,
+        leaveTypeId,
+        startDate,
+        endDate,
+        days,
+        reason,
+        attachmentName,
+        `pending_${approvalFlow.steps[0].role}`,
+        1
+      );
       const requestId = Number(result.lastInsertRowid);
       const code = `LR${String(requestId).padStart(4, '0')}`;
       await client.prepare(
         'UPDATE leave_requests SET request_code = ? WHERE id = ?'
       ).run(code, requestId);
-      for (const [index, role] of ['leader', 'manager', 'hr'].entries()) {
+      for (const [index, approval] of approvalFlow.steps.entries()) {
         await client.prepare(`
-          INSERT INTO approvals (request_id, step, approver_role, action)
-          VALUES (?, ?, ?, ?)
-        `).run(requestId, index + 1, role, index === 0 ? 'pending' : 'waiting');
+          INSERT INTO approvals
+            (request_id, step, approver_role, approver_id, action)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          requestId,
+          index + 1,
+          approval.role,
+          approval.approverId,
+          index === 0 ? 'pending' : 'waiting'
+        );
       }
       await logAudit(
         user,
@@ -305,14 +408,25 @@ async function handleRequests(req, res, url) {
         ipOf(req),
         client
       );
-      await notifyRole(
-        'leader',
-        user.departmentId,
-        `Đơn ${code} chờ duyệt`,
-        `${user.fullName} vừa gửi đơn ${type.name}.`,
-        'approvals',
-        client
-      );
+      const firstApproval = approvalFlow.steps[0];
+      if (firstApproval.approverId) {
+        await notify(
+          firstApproval.approverId,
+          `Đơn ${code} chờ duyệt`,
+          `${user.fullName} vừa gửi đơn ${type.name}.`,
+          'approvals',
+          client
+        );
+      } else {
+        await notifyRole(
+          firstApproval.role,
+          user.departmentId,
+          `Đơn ${code} chờ duyệt`,
+          `${user.fullName} vừa gửi đơn ${type.name}.`,
+          'approvals',
+          client
+        );
+      }
       return serializeRequest(await getRequest(requestId, client), true, client);
     });
     return json(res, 201, { item });
@@ -340,35 +454,53 @@ async function handleRequests(req, res, url) {
   }
 
   if (method === 'GET' && pathname === '/api/approvals') {
-    const user = await requireAuth(req, res, ['leader', 'manager', 'hr']);
+    const user = await requireAuth(req, res, ['leader', 'manager', 'hr', 'admin']);
     if (!user) return true;
-    const status = {
-      leader: 'pending_leader',
-      manager: 'pending_manager',
-      hr: 'pending_hr'
-    }[user.role];
-    let where = 'r.status = ? AND r.user_id != ?';
-    const params = [status, user.id];
+    let where = "a.action = 'pending' AND r.status = CONCAT('pending_', a.approver_role) AND a.approver_role = ? AND r.user_id != ?";
+    const params = [user.role, user.id];
     if (['leader', 'manager'].includes(user.role)) {
-      where += ' AND u.department_id = ?';
-      params.push(user.departmentId);
+      where += ' AND a.approver_id = ?';
+      params.push(user.id);
+    } else {
+      where += ' AND (a.approver_id IS NULL OR a.approver_id = ?)';
+      params.push(user.id);
     }
     const rows = await db.prepare(`
       SELECT r.*, u.full_name, u.employee_code, u.department_id, d.name AS department_name,
              lt.name AS leave_type_name, lt.code AS leave_type_code, lt.annual_quota
       FROM leave_requests r
+      JOIN approvals a ON a.request_id = r.id
       JOIN users u ON u.id = r.user_id
       LEFT JOIN departments d ON d.id = u.department_id
       JOIN leave_types lt ON lt.id = r.leave_type_id
       WHERE ${where}
       ORDER BY r.created_at
     `).all(...params);
-    return json(res, 200, { items: await serializeRequests(rows) });
+    const historyRows = await db.prepare(`
+      SELECT r.*, u.full_name, u.employee_code, u.department_id, d.name AS department_name,
+             lt.name AS leave_type_name, lt.code AS leave_type_code, lt.annual_quota,
+             a.action AS decision_action, a.note AS decision_note, a.acted_at AS decision_at
+      FROM approvals a
+      JOIN leave_requests r ON r.id = a.request_id
+      JOIN users u ON u.id = r.user_id
+      LEFT JOIN departments d ON d.id = u.department_id
+      JOIN leave_types lt ON lt.id = r.leave_type_id
+      WHERE a.approver_id = ? AND a.action IN ('approved', 'rejected')
+      ORDER BY a.acted_at DESC, a.id DESC
+      LIMIT 100
+    `).all(user.id);
+    const history = await serializeRequests(historyRows);
+    history.forEach((item, index) => {
+      item.decisionAction = historyRows[index].decision_action;
+      item.decisionNote = historyRows[index].decision_note || '';
+      item.decisionAt = historyRows[index].decision_at;
+    });
+    return json(res, 200, { items: await serializeRequests(rows), history });
   }
 
   const decisionMatch = pathname.match(/^\/api\/requests\/(\d+)\/decision$/);
   if (method === 'POST' && decisionMatch) {
-    const user = await requireAuth(req, res, ['leader', 'manager', 'hr']);
+    const user = await requireAuth(req, res, ['leader', 'manager', 'hr', 'admin']);
     if (!user) return true;
     const body = await readBody(req);
     const action = body.action === 'approve'
@@ -382,21 +514,26 @@ async function handleRequests(req, res, url) {
 
     const row = await getRequest(Number(decisionMatch[1]));
     if (!row) return fail(res, 404, 'Không tìm thấy đơn nghỉ phép.');
-    const expected = {
-      leader: 'pending_leader',
-      manager: 'pending_manager',
-      hr: 'pending_hr'
-    }[user.role];
-    const step = { leader: 1, manager: 2, hr: 3 }[user.role];
-    if (row.status !== expected) {
+    const approval = await db.prepare(`
+      SELECT * FROM approvals
+      WHERE request_id = ? AND action = 'pending'
+      ORDER BY step
+      LIMIT 1
+    `).get(row.id);
+    if (!approval || row.status !== `pending_${approval.approver_role}`) {
       return fail(res, 409, 'Đơn đã được xử lý hoặc chưa đến bước của bạn.');
+    }
+    if (approval.approver_role !== user.role) {
+      return fail(res, 403, 'Đơn chưa đến cấp duyệt của bạn.');
     }
     if (row.user_id === user.id) {
       return fail(res, 403, 'Bạn không thể tự duyệt đơn của chính mình.');
     }
-    if (['leader', 'manager'].includes(user.role)
-      && row.department_id !== user.departmentId) {
-      return fail(res, 403, 'Bạn chỉ có thể duyệt đơn trong phòng ban của mình.');
+    if (approval.approver_id && approval.approver_id !== user.id) {
+      return fail(res, 403, 'Đơn này đã được phân công cho người quản lý khác.');
+    }
+    if (!approval.approver_id && ['leader', 'manager'].includes(user.role)) {
+      return fail(res, 409, 'Cấp duyệt này chưa được phân công người phụ trách.');
     }
 
     const item = await db.transaction(async (client) => {
@@ -409,20 +546,27 @@ async function handleRequests(req, res, url) {
         note,
         new Date(),
         row.id,
-        step
+        approval.step
       );
 
       let nextStatus;
+      let nextApproval = null;
       if (action === 'reject') {
         nextStatus = `rejected_by_${user.role}`;
       } else {
-        nextStatus = user.role === 'leader'
-          ? 'pending_manager'
-          : user.role === 'manager' ? 'pending_hr' : 'approved';
-        if (step < 3) {
+        nextApproval = await client.prepare(`
+          SELECT * FROM approvals
+          WHERE request_id = ? AND step > ?
+          ORDER BY step
+          LIMIT 1
+        `).get(row.id, approval.step);
+        if (nextApproval) {
+          nextStatus = `pending_${nextApproval.approver_role}`;
           await client.prepare(`
             UPDATE approvals SET action = 'pending' WHERE request_id = ? AND step = ?
-          `).run(row.id, step + 1);
+          `).run(row.id, nextApproval.step);
+        } else {
+          nextStatus = 'approved';
         }
       }
 
@@ -430,7 +574,11 @@ async function handleRequests(req, res, url) {
         UPDATE leave_requests
         SET status = ?, current_step = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run(nextStatus, Math.min(step + (action === 'approve' ? 1 : 0), 3), row.id);
+      `).run(
+        nextStatus,
+        nextApproval ? nextApproval.step : approval.step,
+        row.id
+      );
 
       if (nextStatus === 'approved' && row.annual_quota > 0) {
         const year = Number(row.start_date.slice(0, 4));
@@ -458,16 +606,25 @@ async function handleRequests(req, res, url) {
         'requests',
         client
       );
-      if (action === 'approve' && user.role !== 'hr') {
-        const nextRole = user.role === 'leader' ? 'manager' : 'hr';
-        await notifyRole(
-          nextRole,
-          row.department_id,
-          `Đơn ${row.request_code} chờ duyệt`,
-          `${row.full_name} gửi đơn ${row.leave_type_name}.`,
-          'approvals',
-          client
-        );
+      if (action === 'approve' && nextApproval) {
+        if (nextApproval.approver_id) {
+          await notify(
+            nextApproval.approver_id,
+            `Đơn ${row.request_code} chờ duyệt`,
+            `${row.full_name} gửi đơn ${row.leave_type_name}.`,
+            'approvals',
+            client
+          );
+        } else {
+          await notifyRole(
+            nextApproval.approver_role,
+            row.department_id,
+            `Đơn ${row.request_code} chờ duyệt`,
+            `${row.full_name} gửi đơn ${row.leave_type_name}.`,
+            'approvals',
+            client
+          );
+        }
       }
       return serializeRequest(await getRequest(row.id, client), true, client);
     });

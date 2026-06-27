@@ -32,7 +32,7 @@ async function loadNotifications() {
       }
       $('#notification-panel').classList.remove('open');
       const link = item.dataset.link;
-      if (link === 'approvals' && ['leader', 'manager', 'hr'].includes(state.user.role)) navigate('approvals');
+      if (link === 'approvals' && ['leader', 'manager', 'hr', 'admin'].includes(state.user.role)) navigate('approvals');
       if (link === 'requests' && state.user.role !== 'admin') navigate('requests');
     }));
   } catch {

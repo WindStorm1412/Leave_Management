@@ -27,15 +27,41 @@ async function renderDepartments(target) {
   state.departments = items;
   target.innerHTML = `
     <div class="toolbar"><button id="add-department" class="btn btn-primary filters-end">＋ Thêm phòng ban</button></div>
+    <div class="alert alert-info">Mỗi phòng ban có thể chỉ định một trưởng nhóm và một trưởng phòng. Người được chọn phải có đúng chức vụ và đang thuộc phòng đó.</div>
     <section class="card">${table(
-      ['Mã', 'Tên phòng ban', 'Trưởng phòng', 'Thành viên', 'Ngày tạo', ''],
+      ['Mã', 'Tên phòng ban', 'Trưởng nhóm', 'Trưởng phòng', 'Thành viên', ''],
       items.map((item) => [
-        `<strong>${esc(item.code)}</strong>`, esc(item.name), esc(item.manager || 'Chưa chỉ định'),
-        `${item.members} người`, formatDate(item.createdAt),
+        `<strong>${esc(item.code)}</strong>`,
+        esc(item.name),
+        item.leader ? `<span class="badge badge-info">${esc(item.leader)}</span>` : '<span class="badge badge-warning">Chưa chỉ định</span>',
+        item.manager ? `<span class="badge badge-purple">${esc(item.manager)}</span>` : '<span class="badge badge-danger">Chưa chỉ định</span>',
+        `${item.activeMembers} hoạt động`,
         `<div class="table-actions"><button class="btn btn-outline btn-small edit-department" data-id="${item.id}">Sửa</button>
         <button class="btn btn-danger btn-small delete-department" data-id="${item.id}">Xóa</button></div>`
       ])
-    )}</section>`;
+    )}</section>
+    <div class="organization-grid">
+      ${items.map((item) => `
+        <section class="organization-card">
+          <div class="organization-card-head">
+            <div><span>${esc(item.code)}</span><h3>${esc(item.name)}</h3></div>
+            <strong>${item.activeMembers} người</strong>
+          </div>
+          <div class="organization-roles">
+            <div><small>Trưởng phòng</small><strong>${esc(item.manager || 'Chưa chỉ định')}</strong></div>
+            <div><small>Trưởng nhóm</small><strong>${esc(item.leader || 'Chưa chỉ định')}</strong></div>
+          </div>
+          <div class="organization-members">
+            ${item.people.length ? item.people.map((person) => `
+              <div class="${person.active ? '' : 'inactive'}">
+                <span class="avatar">${esc(initials(person.fullName))}</span>
+                <span><strong>${esc(person.fullName)}</strong><small>${esc(person.employeeCode)} · ${esc(ROLE_LABELS[person.role] || person.role)}</small></span>
+              </div>
+            `).join('') : '<p class="form-hint">Chưa có nhân sự trong phòng ban.</p>'}
+          </div>
+        </section>
+      `).join('')}
+    </div>`;
   $('#add-department').addEventListener('click', () => openDepartmentForm());
   $$('.edit-department').forEach((button) => button.addEventListener('click', () => openDepartmentForm(items.find((item) => item.id === Number(button.dataset.id)))));
   $$('.delete-department').forEach((button) => button.addEventListener('click', async () => {
@@ -51,11 +77,24 @@ async function renderDepartments(target) {
 }
 
 function openDepartmentForm(item = null) {
+  const leaders = item?.people.filter((person) => person.role === 'leader' && person.active) || [];
+  const managers = item?.people.filter((person) => person.role === 'manager' && person.active) || [];
   openModal({
     title: item ? `Cập nhật ${item.name}` : 'Thêm phòng ban',
     body: `<div class="form-grid">
       <div class="form-group"><label class="field-label">Mã phòng ban</label><input id="department-code" class="input" value="${esc(item?.code || '')}"></div>
       <div class="form-group"><label class="field-label">Tên phòng ban</label><input id="department-name" class="input" value="${esc(item?.name || '')}"></div>
+      ${item ? `
+        <div class="form-group"><label class="field-label">Trưởng nhóm phụ trách</label><select id="department-leader" class="input">
+          <option value="">Chưa chỉ định</option>
+          ${leaders.map((person) => `<option value="${person.id}" ${person.id === item.leaderId ? 'selected' : ''}>${esc(person.fullName)} · ${esc(person.employeeCode)}</option>`).join('')}
+        </select></div>
+        <div class="form-group"><label class="field-label">Trưởng phòng phụ trách</label><select id="department-manager" class="input">
+          <option value="">Chưa chỉ định</option>
+          ${managers.map((person) => `<option value="${person.id}" ${person.id === item.managerId ? 'selected' : ''}>${esc(person.fullName)} · ${esc(person.employeeCode)}</option>`).join('')}
+        </select></div>
+        <div class="form-group full"><span class="form-hint">Nếu danh sách trống, hãy vào tab Tài khoản, đặt đúng chức vụ và phòng ban cho nhân sự trước.</span></div>
+      ` : '<div class="form-group full"><span class="form-hint">Sau khi tạo phòng, thêm nhân sự rồi quay lại để chỉ định người phụ trách.</span></div>'}
     </div>`,
     footer: '<button class="btn btn-outline" data-close-modal>Hủy</button><button id="save-department" class="btn btn-primary">Lưu</button>'
   });
@@ -64,7 +103,12 @@ function openDepartmentForm(item = null) {
     try {
       await api(item ? `/api/departments/${item.id}` : '/api/departments', {
         method: item ? 'PUT' : 'POST',
-        body: { code: $('#department-code').value.trim(), name: $('#department-name').value.trim() }
+        body: {
+          code: $('#department-code').value.trim(),
+          name: $('#department-name').value.trim(),
+          leaderId: item ? Number($('#department-leader').value || 0) : undefined,
+          managerId: item ? Number($('#department-manager').value || 0) : undefined
+        }
       });
       closeModal();
       toast('Đã lưu phòng ban.');
@@ -155,7 +199,7 @@ async function renderPolicies() {
         ]))}
       </section>
     </div>
-    <div class="alert alert-warning">Đơn nghỉ đi qua ba bước: Trưởng nhóm → Trưởng phòng → HR. Người duyệt không thể tự duyệt đơn của chính mình.</div>`;
+    <div class="alert alert-warning">Luồng duyệt phụ thuộc chức vụ: nhân viên đi qua cấp quản lý của phòng rồi HR; trưởng nhóm bắt đầu từ trưởng phòng; trưởng phòng chuyển thẳng HR; đơn của HR do quản trị viên xác nhận. Không ai được tự duyệt đơn của mình.</div>`;
 }
 
 async function renderProfile() {
@@ -164,7 +208,9 @@ async function renderProfile() {
     ${pageHeading('Hồ sơ cá nhân', 'Cập nhật thông tin liên hệ và bảo mật tài khoản')}
     <div class="profile-card">
       <span class="avatar">${esc(user.avatar)}</span>
-      <div><h2>${esc(user.fullName)}</h2><p>${esc(user.roleLabel)} · ${esc(user.department)} · ${esc(user.employeeCode)}</p></div>
+      <div><h2>${esc(user.fullName)}</h2><p>${esc(user.roleLabel)} · ${esc(user.department)} · ${esc(user.employeeCode)}</p>
+      ${user.isDepartmentManager ? '<span class="badge badge-purple">Trưởng phòng được phân công</span>' : ''}
+      ${user.isDepartmentLeader ? '<span class="badge badge-info">Trưởng nhóm được phân công</span>' : ''}</div>
     </div>
     <div class="grid equal">
       <section class="card">

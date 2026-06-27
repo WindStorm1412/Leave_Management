@@ -3,6 +3,23 @@ const { json, fail, readBody } = require('../http');
 const { requireAuth, ipOf } = require('../auth');
 const { isDuplicateError } = require('../leave-utils');
 
+async function validateDepartmentApprover(userId, role, departmentId, client = db) {
+  if (!userId) return null;
+  const person = await client.prepare(`
+    SELECT id, full_name, role, department_id, active
+    FROM users WHERE id = ?
+  `).get(userId);
+  if (!person || !person.active || person.role !== role
+    || Number(person.department_id) !== Number(departmentId)) {
+    const label = role === 'manager' ? 'trưởng phòng' : 'trưởng nhóm';
+    throw Object.assign(
+      new Error(`Người được chọn làm ${label} phải đang hoạt động, có đúng chức vụ và thuộc phòng ban này.`),
+      { statusCode: 400 }
+    );
+  }
+  return person;
+}
+
 async function handleAdmin(req, res, url) {
   const { pathname } = url;
   const method = req.method;
@@ -12,18 +29,41 @@ async function handleAdmin(req, res, url) {
     if (!user) return true;
     const rows = await db.prepare(`
       SELECT d.*, COUNT(u.id) AS members,
-             MAX(CASE WHEN u.role = 'manager' THEN u.full_name ELSE '' END) AS manager
+             SUM(CASE WHEN u.active = 1 THEN 1 ELSE 0 END) AS active_members,
+             SUM(CASE WHEN u.role = 'employee' AND u.active = 1 THEN 1 ELSE 0 END) AS employees,
+             MAX(leader.full_name) AS leader_name,
+             MAX(manager.full_name) AS manager_name
       FROM departments d
       LEFT JOIN users u ON u.department_id = d.id
+      LEFT JOIN users leader ON leader.id = d.leader_id
+      LEFT JOIN users manager ON manager.id = d.manager_id
       GROUP BY d.id
       ORDER BY d.code
+    `).all();
+    const people = await db.prepare(`
+      SELECT id, employee_code, full_name, role, department_id, active
+      FROM users
+      WHERE department_id IS NOT NULL
+      ORDER BY full_name
     `).all();
     const items = rows.map((row) => ({
       id: row.id,
       code: row.code,
       name: row.name,
       members: row.members,
-      manager: row.manager || '',
+      activeMembers: row.active_members,
+      employees: row.employees,
+      leaderId: row.leader_id,
+      leader: row.leader_name || '',
+      managerId: row.manager_id,
+      manager: row.manager_name || '',
+      people: people.filter((person) => person.department_id === row.id).map((person) => ({
+        id: person.id,
+        employeeCode: person.employee_code,
+        fullName: person.full_name,
+        role: person.role,
+        active: Boolean(person.active)
+      })),
       createdAt: row.created_at
     }));
     return json(res, 200, { items });
@@ -46,6 +86,7 @@ async function handleAdmin(req, res, url) {
       await logAudit(user, 'Tạo phòng ban', `Tạo phòng ban ${body.name}`, ipOf(req));
       return json(res, 201, { id: Number(result.lastInsertRowid) });
     } catch (error) {
+      if (error.statusCode) return fail(res, error.statusCode, error.message);
       if (isDuplicateError(error)) {
         return fail(res, 409, 'Mã hoặc tên phòng ban đã tồn tại.');
       }
@@ -63,13 +104,43 @@ async function handleAdmin(req, res, url) {
     );
     if (!current) return fail(res, 404, 'Không tìm thấy phòng ban.');
     try {
-      await db.prepare(`
-        UPDATE departments SET code = ?, name = ? WHERE id = ?
-      `).run(
-        String(body.code ?? current.code).trim().toUpperCase(),
-        String(body.name ?? current.name).trim(),
-        current.id
-      );
+      const leaderId = body.leaderId === undefined
+        ? current.leader_id
+        : Number(body.leaderId || 0) || null;
+      const managerId = body.managerId === undefined
+        ? current.manager_id
+        : Number(body.managerId || 0) || null;
+      await db.transaction(async (client) => {
+        await validateDepartmentApprover(leaderId, 'leader', current.id, client);
+        await validateDepartmentApprover(managerId, 'manager', current.id, client);
+        await client.prepare(`
+          UPDATE departments
+          SET code = ?, name = ?, leader_id = ?, manager_id = ?
+          WHERE id = ?
+        `).run(
+          String(body.code ?? current.code).trim().toUpperCase(),
+          String(body.name ?? current.name).trim(),
+          leaderId,
+          managerId,
+          current.id
+        );
+        await client.prepare(`
+          UPDATE approvals a
+          JOIN leave_requests r ON r.id = a.request_id
+          JOIN users requester ON requester.id = r.user_id
+          SET a.approver_id = ?
+          WHERE requester.department_id = ? AND a.approver_role = 'leader'
+            AND a.action IN ('pending', 'waiting')
+        `).run(leaderId, current.id);
+        await client.prepare(`
+          UPDATE approvals a
+          JOIN leave_requests r ON r.id = a.request_id
+          JOIN users requester ON requester.id = r.user_id
+          SET a.approver_id = ?
+          WHERE requester.department_id = ? AND a.approver_role = 'manager'
+            AND a.action IN ('pending', 'waiting')
+        `).run(managerId, current.id);
+      });
       await logAudit(
         user,
         'Cập nhật phòng ban',
@@ -78,6 +149,7 @@ async function handleAdmin(req, res, url) {
       );
       return json(res, 200, { ok: true });
     } catch (error) {
+      if (error.statusCode) return fail(res, error.statusCode, error.message);
       if (isDuplicateError(error)) {
         return fail(res, 409, 'Mã hoặc tên phòng ban đã tồn tại.');
       }

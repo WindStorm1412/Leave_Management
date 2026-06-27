@@ -46,6 +46,11 @@ function staticChecks() {
   assert.doesNotMatch(serverSource, /node:sqlite/);
   assert.doesNotMatch(serverSource, /datetime\('now'\)/);
   assert.doesNotMatch(serverSource, /db\.exec\('BEGIN'\)/);
+  assert.match(sql, /leader_id INT UNSIGNED NULL/);
+  assert.match(sql, /manager_id INT UNSIGNED NULL/);
+  assert.match(sql, /approver_role ENUM\('leader','manager','hr','admin'\)/);
+  assert.match(read('src/routes/requests.js'), /buildApprovalFlow/);
+  assert.match(read('src/routes/requests.js'), /decision_action/);
 
   for (const table of [
     'departments', 'users', 'leave_types', 'leave_balances', 'leave_requests',
